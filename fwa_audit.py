@@ -276,6 +276,240 @@ def audit(wallet, fetcher, eth_price, fwa_price):
     }
 
 
+# --------------------------------------------------------------------------
+# Offline mode — Etherscan CSV exports
+#
+# Needs no network at all. On the Etherscan address page, each tab has a
+# "Download Page Data" / CSV Export button:
+#     Transactions -> Internal Transactions -> ERC-20 Token Txns
+#                  -> ERC-721 Token Txns    -> ERC-1155 Token Txns
+# Drop every CSV into one folder and point --from-csv at it. Filenames do not
+# matter; each file is classified by its header row.
+#
+# Rows are normalised into the exact record shape the API returns, so the same
+# audit() runs over them and the arithmetic is identical either way.
+# --------------------------------------------------------------------------
+import csv
+import glob
+
+
+def _n(s):
+    """Normalise a header cell so column matching survives Etherscan's
+    formatting churn: 'Value_IN(ETH)' -> 'valueineth'."""
+    out = []
+    for ch in (s or ""):
+        if ch.isalnum():
+            out.append(ch.lower())
+    return "".join(out)
+
+
+def _dec(s):
+    """Etherscan writes '1,234.56', '' and sometimes '0E-18'."""
+    s = (s or "").strip().replace(",", "").replace('"', "")
+    if not s:
+        return Decimal(0)
+    try:
+        return Decimal(s)
+    except Exception:
+        return Decimal(0)
+
+
+class CsvFetcher:
+    def __init__(self, directory, wallet, eth_balance=None, verbose=True):
+        self.dir = directory
+        self.w = wallet.lower()
+        self._eth_bal = Decimal(str(eth_balance)) if eth_balance is not None else None
+        self.verbose = verbose
+        self.buckets = {k: [] for k in
+                        ("txlist", "txlistinternal", "tokentx", "tokennfttx", "token1155tx")}
+        self._fwa_net = Decimal(0)
+        self._failed_seen = 0
+        self._load()
+
+    def log(self, msg):
+        if self.verbose:
+            print(f"  {msg}", file=sys.stderr)
+
+    # -- column resolution ------------------------------------------------
+    @staticmethod
+    def _col(fields, *candidates, avoid=()):
+        norm = {_n(f): f for f in fields}
+        for c in candidates:
+            if c in norm:
+                return norm[c]
+        for c in candidates:                      # substring fallback
+            for nf, orig in norm.items():
+                if c in nf and not any(a in nf for a in avoid):
+                    return orig
+        return None
+
+    @staticmethod
+    def _classify(fields):
+        n = {_n(f) for f in fields}
+        if any("parenttx" in f for f in n):
+            return "txlistinternal"
+        has_tokenid = any(f in ("tokenid", "tokenids") for f in n)
+        has_tokenval = any("tokenvalue" in f or "tokenqty" in f for f in n)
+        if has_tokenid and has_tokenval:
+            return "token1155tx"
+        if has_tokenid:
+            return "tokennfttx"
+        if any("tokensymbol" in f or "tokenname" in f for f in n) or has_tokenval:
+            return "tokentx"
+        if any("txnfee" in f for f in n) or "method" in n:
+            return "txlist"
+        return None
+
+    @staticmethod
+    def _failed(row, fields):
+        """Etherscan marks reverts inconsistently across export versions:
+        a 'Status' of 'Error(0)', a non-empty 'ErrCode', or Status == '1'."""
+        for f in fields:
+            nf = _n(f)
+            if nf in ("status", "errcode", "error"):
+                v = (row.get(f) or "").strip().lower()
+                if not v:
+                    continue
+                if "error" in v or "fail" in v or "revert" in v:
+                    return True
+                if nf == "status" and v == "1":
+                    return True
+        return False
+
+    # -- loading ----------------------------------------------------------
+    def _load(self):
+        files = sorted(glob.glob(os.path.join(self.dir, "*.csv")))
+        if not files:
+            raise SystemExit(f"No .csv files found in {self.dir}")
+        for path in files:
+            with open(path, newline="", encoding="utf-8-sig") as fh:
+                rows = list(csv.DictReader(fh))
+            if not rows:
+                self.log(f"{os.path.basename(path)}: empty, skipped")
+                continue
+            fields = list(rows[0].keys())
+            kind = self._classify(fields)
+            if not kind:
+                self.log(f"{os.path.basename(path)}: unrecognised header, skipped")
+                continue
+            before = len(self.buckets[kind])
+            getattr(self, f"_load_{kind}")(rows, fields)
+            self.log(f"{os.path.basename(path)}: {kind} "
+                     f"+{len(self.buckets[kind]) - before} rows")
+
+    def _common(self, row, fields):
+        h = self._col(fields, "transactionhash", "txhash", "hash")
+        t = self._col(fields, "unixtimestamp", "timestamp")
+        return ((row.get(h) or "").strip(),
+                str(int(_dec(row.get(t)))) if t else "0")
+
+    def _load_txlist(self, rows, fields):
+        c_from = self._col(fields, "from")
+        c_to   = self._col(fields, "to", avoid=("contract",))
+        c_ctr  = self._col(fields, "contractaddress")
+        c_in   = self._col(fields, "valueineth", "valuein")
+        c_out  = self._col(fields, "valueouteth", "valueout")
+        c_fee  = self._col(fields, "txnfeeeth", "txnfee")
+        for r in rows:
+            h, ts = self._common(r, fields)
+            failed = self._failed(r, fields)
+            self._failed_seen += bool(failed)
+            frm = (r.get(c_from) or "").strip()
+            to  = (r.get(c_to) or "").strip() or (r.get(c_ctr) or "").strip()
+            val = _dec(r.get(c_in)) + _dec(r.get(c_out))
+            fee = _dec(r.get(c_fee))
+            # audit() computes gas as gasUsed*gasPrice/WEI; the CSV gives the
+            # fee directly, so express it as (fee_in_wei x 1) for an exact match.
+            self.buckets["txlist"].append({
+                "from": frm, "to": to, "hash": h, "timeStamp": ts,
+                "value": str(int(val * WEI)),
+                "isError": "1" if failed else "0",
+                "gasUsed": str(int(fee * WEI)) if frm.lower() == self.w else "0",
+                "gasPrice": "1",
+            })
+
+    def _load_txlistinternal(self, rows, fields):
+        c_from = self._col(fields, "from", avoid=("parent",))
+        c_to   = self._col(fields, "txto", "to", avoid=("parent", "contract"))
+        c_in   = self._col(fields, "valueineth", "valuein")
+        c_out  = self._col(fields, "valueouteth", "valueout")
+        for r in rows:
+            h, ts = self._common(r, fields)
+            self.buckets["txlistinternal"].append({
+                "from": (r.get(c_from) or "").strip(),
+                "to": (r.get(c_to) or "").strip(),
+                "hash": h, "timeStamp": ts,
+                "value": str(int((_dec(r.get(c_in)) + _dec(r.get(c_out))) * WEI)),
+                "isError": "1" if self._failed(r, fields) else "0",
+            })
+
+    def _load_tokentx(self, rows, fields):
+        c_from = self._col(fields, "from")
+        c_to   = self._col(fields, "to", avoid=("contract",))
+        c_ctr  = self._col(fields, "contractaddress")
+        c_val  = self._col(fields, "tokenvalue", "tokenqty", "value")
+        c_sym  = self._col(fields, "tokensymbol")
+        for r in rows:
+            h, ts = self._common(r, fields)
+            amt = _dec(r.get(c_val))
+            ctr = (r.get(c_ctr) or "").strip()
+            # tokenDecimal "0" => audit() divides by 1, so pass human units.
+            self.buckets["tokentx"].append({
+                "from": (r.get(c_from) or "").strip(),
+                "to": (r.get(c_to) or "").strip(),
+                "contractAddress": ctr, "value": str(amt), "tokenDecimal": "0",
+                "tokenSymbol": (r.get(c_sym) or "").strip(),
+                "hash": h, "timeStamp": ts,
+            })
+            if ctr.lower() == FWA_TOKEN:
+                if (r.get(c_to) or "").strip().lower() == self.w:
+                    self._fwa_net += amt
+                elif (r.get(c_from) or "").strip().lower() == self.w:
+                    self._fwa_net -= amt
+
+    def _load_nft(self, rows, fields, bucket, with_qty):
+        c_from = self._col(fields, "from")
+        c_to   = self._col(fields, "to", avoid=("contract",))
+        c_ctr  = self._col(fields, "contractaddress")
+        c_id   = self._col(fields, "tokenid", "tokenids")
+        c_name = self._col(fields, "tokenname")
+        c_qty  = self._col(fields, "tokenvalue", "tokenqty") if with_qty else None
+        for r in rows:
+            h, ts = self._common(r, fields)
+            rec = {
+                "from": (r.get(c_from) or "").strip(),
+                "to": (r.get(c_to) or "").strip(),
+                "contractAddress": (r.get(c_ctr) or "").strip(),
+                "tokenID": (r.get(c_id) or "").strip(),
+                "tokenName": (r.get(c_name) or "").strip() or "?",
+                "hash": h, "timeStamp": ts,
+            }
+            if with_qty:
+                rec["tokenValue"] = str(_dec(r.get(c_qty)) or 1)
+            self.buckets[bucket].append(rec)
+
+    def _load_tokennfttx(self, rows, fields):
+        self._load_nft(rows, fields, "tokennfttx", with_qty=False)
+
+    def _load_token1155tx(self, rows, fields):
+        self._load_nft(rows, fields, "token1155tx", with_qty=True)
+
+    # -- Fetcher interface ------------------------------------------------
+    def paginate(self, action, address, extra=None):
+        return self.buckets.get(action, [])
+
+    def eth_balance(self, address):
+        if self._eth_bal is None:
+            self.log("no --eth-balance given; wallet ETH balance reported as 0")
+            return Decimal(0)
+        return self._eth_bal
+
+    def token_balance(self, address, token):
+        # tokentx rows carry tokenDecimal "0", so audit() divides by 1 —
+        # return the net flow in the same human units.
+        return self._fwa_net if token.lower() == FWA_TOKEN else Decimal(0)
+
+
 def label(addr):
     a = (addr or "").lower()
     if a == FWA_TOKEN:
@@ -468,18 +702,29 @@ def main():
     ap.add_argument("wallet")
     ap.add_argument("--source", choices=["etherscan", "blockscout"], default="etherscan")
     ap.add_argument("--api-key", default=os.environ.get("ETHERSCAN_API_KEY"))
+    ap.add_argument("--from-csv", metavar="DIR",
+                    help="offline mode: folder of Etherscan CSV exports (no network)")
+    ap.add_argument("--eth-balance", type=float,
+                    help="current wallet ETH balance (offline mode can't read it)")
     ap.add_argument("--eth-price", type=float)
     ap.add_argument("--fwa-price", type=float)
     ap.add_argument("--out")
     ap.add_argument("--json", help="also dump raw totals as JSON")
     args = ap.parse_args()
 
-    if args.source == "etherscan" and not args.api_key:
-        print("No ETHERSCAN_API_KEY set — falling back to Blockscout.", file=sys.stderr)
-        args.source = "blockscout"
+    if args.from_csv:
+        f = CsvFetcher(args.from_csv, args.wallet, eth_balance=args.eth_balance)
+        eth_price = Decimal(str(args.eth_price)) if args.eth_price else None
+        fwa_price = Decimal(str(args.fwa_price)) if args.fwa_price else None
+        if not eth_price:
+            print("Tip: pass --eth-price/--fwa-price for USD columns.", file=sys.stderr)
+    else:
+        if args.source == "etherscan" and not args.api_key:
+            print("No ETHERSCAN_API_KEY set — falling back to Blockscout.", file=sys.stderr)
+            args.source = "blockscout"
+        eth_price, fwa_price = fetch_prices(args)
+        f = Fetcher(args.source, args.api_key)
 
-    eth_price, fwa_price = fetch_prices(args)
-    f = Fetcher(args.source, args.api_key)
     r = audit(args.wallet, f, eth_price, fwa_price)
     report(r)
 

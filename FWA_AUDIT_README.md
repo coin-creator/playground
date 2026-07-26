@@ -11,9 +11,39 @@ The session this was written in has an egress policy that blocks every
 blockchain data source — Etherscan, Blockscout, Routescan, all public RPC
 endpoints, CoinGecko, OpenSea, Reservoir, and `fwa.fun` itself all return
 `403` at the proxy. No wallet data could be read, so no real numbers were
-produced. Run this from a machine with normal internet access to get them.
+produced.
 
-## Run it
+There are two ways to get them, and **offline mode needs no network at all**.
+
+## Offline mode (works anywhere, including from a blocked session)
+
+The audit doesn't need the *tool* to have internet — it needs the *data*.
+Etherscan exports it straight from the address page. On
+`https://etherscan.io/address/<wallet>`, use the CSV export / "Download Page
+Data" button on each tab:
+
+- Transactions
+- **Internal Transactions** ← do not skip this one
+- ERC-20 Token Txns
+- ERC-721 Token Txns
+- ERC-1155 Token Txns (if any)
+
+Drop every CSV into one folder — filenames don't matter, each file is
+classified by its header row — then:
+
+```bash
+python3 fwa_audit.py 0xYourWallet --from-csv ./exports \
+    --eth-balance 2.5 --eth-price 3200 --fwa-price 0.0285
+```
+
+`--eth-balance` and the prices are optional; offline mode can't look them up,
+so pass them if you want the balance and USD columns filled in.
+
+CSV rows are normalised into the same record shape the API returns, so the
+identical `audit()` runs over them — both paths were verified to produce
+byte-identical totals on the same fixture data.
+
+## Live mode (needs network access)
 
 ```bash
 pip install requests openpyxl
