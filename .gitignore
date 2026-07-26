@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Audit output — contains wallet activity, keep it local
+fwa_audit_*.xlsx
+*.json
