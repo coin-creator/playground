@@ -83,7 +83,34 @@ script counts gas on reverted txs and excludes their value. Failed internal
 transfers (`isError=1`) are excluded entirely — counting them would invent
 income that never landed.
 
-## What it deliberately cannot value
+## Reading contract state — `fwa_probe.py`
+
+`fwa_audit.py` sees transfers. It cannot see backing ETH or unclaimed rewards,
+because those are contract state that has never moved. `fwa_probe.py` reads
+them directly:
+
+```bash
+python3 fwa_probe.py 0xYourWallet --vault 0xVaultAddress
+python3 fwa_probe.py 0xYourWallet --vault auto --from-csv ./exports
+```
+
+It pulls the vault's **verified ABI from Etherscan** (following EIP-1967 /
+EIP-1822 proxies to the implementation), enumerates `view`/`pure` functions
+taking `()` or `(address)` and returning numbers, ranks them by name relevance,
+and `eth_call`s each one.
+
+It reads the ABI rather than guessing selectors like `claimable(address)` on
+spec. A guessed signature that happens to collide with a real function returns
+a number that looks plausible and means something else entirely.
+
+**Every read is a heuristic.** A name is not a guarantee — `claimable(address)`
+means withdrawable ETH on one protocol and unvested emissions on another. The
+script prints the full signature next to each value so you can confirm the
+meaning on Etherscan's `#readContract` tab before relying on it. If the vault
+source is unverified, the script says so and reads nothing rather than
+inventing an interpretation.
+
+## What `fwa_audit.py` deliberately cannot value
 
 Two components live as contract state, not as transfers, so no explorer API
 can see them:
