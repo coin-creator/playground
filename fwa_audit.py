@@ -377,25 +377,105 @@ class CsvFetcher:
         return False
 
     # -- loading ----------------------------------------------------------
+    def _sources(self):
+        """Yield (display_name, text) for every CSV found, including inside
+        .zip archives — Etherscan hands you a zip, and unpacking it by hand is
+        a pointless step to impose."""
+        if os.path.isfile(self.dir):
+            paths = [self.dir]
+        else:
+            paths = sorted(glob.glob(os.path.join(self.dir, "*.csv")) +
+                           glob.glob(os.path.join(self.dir, "*.zip")))
+        if not paths:
+            raise SystemExit(f"No .csv or .zip files found in {self.dir}")
+        for path in paths:
+            if path.lower().endswith(".zip"):
+                import zipfile
+                with zipfile.ZipFile(path) as z:
+                    for member in z.namelist():
+                        if not member.lower().endswith(".csv"):
+                            continue
+                        with z.open(member) as fh:
+                            yield (f"{os.path.basename(path)}:{member}",
+                                   fh.read().decode("utf-8-sig", errors="replace"))
+            else:
+                with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                    yield (os.path.basename(path), fh.read())
+
+    @staticmethod
+    def _dedupe_key(kind, rec):
+        """A stable identity for a record, so the same transfer arriving from
+        two files is counted once. Downloading Etherscan's zip and then
+        unzipping it in the same folder is normal, and double-counting a whole
+        ledger would be silent and wrong."""
+        base = (rec.get("hash", ""), (rec.get("from") or "").lower(),
+                (rec.get("to") or "").lower())
+        if kind == "txlist":
+            return base[0]                       # one normal tx per hash
+        if kind == "txlistinternal":
+            return base + (rec.get("value", ""),)
+        if kind == "tokentx":
+            return base + ((rec.get("contractAddress") or "").lower(),
+                           rec.get("value", ""))
+        return base + ((rec.get("contractAddress") or "").lower(),
+                       rec.get("tokenID", ""), rec.get("tokenValue", ""))
+
     def _load(self):
-        files = sorted(glob.glob(os.path.join(self.dir, "*.csv")))
-        if not files:
-            raise SystemExit(f"No .csv files found in {self.dir}")
-        for path in files:
-            with open(path, newline="", encoding="utf-8-sig") as fh:
-                rows = list(csv.DictReader(fh))
+        seen_kinds = set()
+        self._seen = {k: set() for k in self.buckets}
+        dupes = 0
+        for name, text in self._sources():
+            rows = list(csv.DictReader(text.splitlines()))
             if not rows:
-                self.log(f"{os.path.basename(path)}: empty, skipped")
+                self.log(f"{name}: empty, skipped")
                 continue
             fields = list(rows[0].keys())
             kind = self._classify(fields)
             if not kind:
-                self.log(f"{os.path.basename(path)}: unrecognised header, skipped")
+                self.log(f"{name}: unrecognised header, skipped")
                 continue
             before = len(self.buckets[kind])
             getattr(self, f"_load_{kind}")(rows, fields)
-            self.log(f"{os.path.basename(path)}: {kind} "
-                     f"+{len(self.buckets[kind]) - before} rows")
+
+            # Filter ONLY the slice this file just appended; records kept from
+            # earlier files are already in `seen` and must not be re-tested.
+            fresh, seen = [], self._seen[kind]
+            for rec in self.buckets[kind][before:]:
+                k = self._dedupe_key(kind, rec)
+                if k in seen:
+                    dupes += 1
+                    continue
+                seen.add(k)
+                fresh.append(rec)
+            self.buckets[kind] = self.buckets[kind][:before] + fresh
+            seen_kinds.add(kind)
+            skipped = len(rows) - len(fresh)
+            self.log(f"{name}: {kind} +{len(fresh)} rows"
+                     + (f" ({skipped} duplicate(s) skipped)" if skipped > 0 else ""))
+
+        if dupes:
+            self.log("")
+            self.log(f"NOTE: {dupes} duplicate record(s) ignored — the same "
+                     f"transfers appeared in more than one file")
+            self.log("(e.g. a .zip alongside its own extracted .csv files).")
+
+        # FWA net flow must be recomputed from the deduped rows, since
+        # _load_tokentx accumulated it while duplicates were still present.
+        self._fwa_net = Decimal(0)
+        for rec in self.buckets["tokentx"]:
+            if (rec.get("contractAddress") or "").lower() != FWA_TOKEN:
+                continue
+            amt = _dec(rec.get("value"))
+            if (rec.get("to") or "").lower() == self.w:
+                self._fwa_net += amt
+            elif (rec.get("from") or "").lower() == self.w:
+                self._fwa_net -= amt
+
+        if "txlistinternal" not in seen_kinds:
+            self.log("")
+            self.log("WARNING: no Internal Transactions export found. On FWA that")
+            self.log("is where sell-backs, fee shares and reward claims arrive —")
+            self.log("without it 'ETH received' will be badly understated.")
 
     def _common(self, row, fields):
         h = self._col(fields, "transactionhash", "txhash", "hash")
@@ -517,6 +597,20 @@ def label(addr):
     return KNOWN.get(a, "")
 
 
+def vault_candidate(r):
+    """Best guess at the FWA vault: the highest-volume counterparty that isn't
+    a known DEX/marketplace/token. A guess, not a determination — the caller
+    must verify it on Etherscan."""
+    ranked = sorted(r["counterparties"].items(),
+                    key=lambda kv: -(kv[1]["out"] + kv[1]["in"]))
+    for addr, v in ranked:
+        if label(addr):
+            continue
+        if v["out"] > 0 or v["txs"] >= 2:
+            return addr, v
+    return None, None
+
+
 def report(r):
     e = r["eth_price"]
     m = lambda x: f"  (${x * e:,.0f})" if e else ""
@@ -600,10 +694,16 @@ def report(r):
                      + market value of NFTs held + FWA held
 
   Also note: the counterparty table separates gacha spins from FWA token
-  buys/sells. Uniswap rows are token trading; the unlabelled high-volume
-  contract you interact with repeatedly is the FWA vault -- verify it on
-  Etherscan before trusting the split.
+  buys/sells. Uniswap rows are token trading, not spins.
 """)
+    vault, vstats = vault_candidate(r)
+    if vault:
+        p(f"  Likely FWA vault: {vault}")
+        p(f"    {vstats['txs']} txs, {vstats['out']:.4f} ETH out, "
+          f"{vstats['in']:.4f} ETH in")
+        p(f"    https://etherscan.io/address/{vault}")
+        p("    ^ a GUESS from volume ranking. Verify before relying on the")
+        p("      gacha-vs-DEX split, then feed it to fwa_probe.py --vault\n")
 
 
 def write_xlsx(r, path):
@@ -733,10 +833,17 @@ def main():
         print(f"\nSpreadsheet written: {out}\n")
 
     if args.json:
+        vault, vstats = vault_candidate(r)
+        payload = {k: (float(v) if isinstance(v, Decimal) else v)
+                   for k, v in r.items() if isinstance(v, (Decimal, int, str))}
+        payload["vault_candidate"] = vault
+        if vstats:
+            payload["vault_candidate_stats"] = {
+                "eth_out": float(vstats["out"]), "eth_in": float(vstats["in"]),
+                "txs": vstats["txs"]}
+        payload["nfts_held"] = len(r["still_held"])
         with open(args.json, "w") as fh:
-            json.dump({k: (float(v) if isinstance(v, Decimal) else v)
-                       for k, v in r.items()
-                       if isinstance(v, (Decimal, int, str))}, fh, indent=2)
+            json.dump(payload, fh, indent=2)
 
 
 if __name__ == "__main__":

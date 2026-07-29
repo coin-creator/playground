@@ -16,4 +16,5 @@ fwa_audit_*.xlsx
 *.xlsx
 *.csv
 exports/
+reports/
 *.json

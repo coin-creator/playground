@@ -13,7 +13,41 @@ endpoints, CoinGecko, OpenSea, Reservoir, and `fwa.fun` itself all return
 `403` at the proxy. No wallet data could be read, so no real numbers were
 produced.
 
-There are two ways to get them, and **offline mode needs no network at all**.
+That environment's policy turned out to be a **GitHub + PyPI allowlist** — even
+`example.com` is refused — so no chain data source is reachable from it at all.
+Run it locally instead.
+
+## Quick start (recommended)
+
+```bash
+git clone <this repo> && cd playground
+./run_local.sh
+```
+
+That creates a virtualenv, installs dependencies, prompts for your Etherscan
+key (hidden, optionally saved to a git-ignored `.env`), validates the key
+before doing any real work, pulls the full ledger, then reads vault contract
+state. Output lands in `reports/<timestamp>/`:
+
+| File | Contents |
+|---|---|
+| `report.txt` | full console accounting |
+| `fwa_audit.xlsx` | Summary / Counterparties / NFT Events / Held NFTs |
+| `summary.json` | machine-readable totals |
+| `vault_state.txt` | heuristic contract reads |
+
+Other forms:
+
+```bash
+./run_local.sh 0xOtherWallet            # different wallet
+./run_local.sh --csv ./exports          # offline, from CSV exports
+./run_local.sh --vault 0xVault          # skip vault auto-detection
+```
+
+Needs bash — macOS, Linux, or WSL. On Windows without WSL, run the two Python
+scripts directly as shown below.
+
+The rest of this document covers the pieces individually.
 
 ## Offline mode (works anywhere, including from a blocked session)
 
