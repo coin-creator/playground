@@ -1,0 +1,7 @@
+requests>=2.31
+openpyxl>=3.1
+
+# Only needed for fwa_probe.py (contract state reads)
+eth-abi>=5.0
+eth-utils>=4.0
+eth-hash[pycryptodome]>=0.6

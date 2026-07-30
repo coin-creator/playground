@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Never commit API keys. Both scripts read ETHERSCAN_API_KEY from the
+# environment; if you keep it in a file locally, keep it in one of these.
+.env
+.env.*
+*.key
+secrets.*
+
+# Audit output — contains wallet activity, keep it local
+fwa_audit_*.xlsx
+*.xlsx
+*.csv
+exports/
+reports/
+*.json
